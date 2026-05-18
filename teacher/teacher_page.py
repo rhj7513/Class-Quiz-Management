@@ -1,4 +1,5 @@
 import streamlit as st
+from streamlit_js_eval import streamlit_js_eval
 
 from server.database import (
     create_class,
@@ -245,9 +246,14 @@ def render_teacher_page():
 
         st.divider()
 
+        current_url = streamlit_js_eval(
+            js_expressions="window.location.origin",
+            key="get_current_url"
+        )
+
         base_url = st.text_input(
             "배포 주소 또는 현재 주소",
-            value="http://localhost:8501",
+            value=current_url or "",
             placeholder="예: https://example.streamlit.app"
         )
 
