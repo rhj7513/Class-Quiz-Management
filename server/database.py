@@ -10,34 +10,23 @@ DB_PATH = ""
 
 
 def get_database_url():
-    database_url = st.secrets.get("DATABASE_URL", None)
-
+    database_url = st.secrets.get("DATABASE_URL", None) or os.environ.get("DATABASE_URL")
     if not database_url:
-        database_url = os.environ.get("DATABASE_URL")
-
-    if not database_url:
-        raise RuntimeError("DATABASE_URL이 설정되지 않았습니다. Streamlit Secrets를 확인해주세요.")
-
+        raise RuntimeError("DATABASE_URL이 설정되지 않았습니다.")
     if database_url.startswith("postgres://"):
         database_url = database_url.replace("postgres://", "postgresql://", 1)
-
     return database_url
 
 
 def get_engine():
-    return create_engine(
-        get_database_url(),
-        pool_pre_ping=True,
-        pool_recycle=300,
-    )
+    return create_engine(get_database_url(), pool_pre_ping=True, pool_recycle=300)
 
 
 def row_to_dict(row):
     data = dict(row)
-
-    if "image_data" in data and isinstance(data["image_data"], memoryview):
-        data["image_data"] = bytes(data["image_data"])
-
+    for key in ["image_data"]:
+        if key in data and isinstance(data[key], memoryview):
+            data[key] = bytes(data[key])
     return data
 
 
@@ -52,8 +41,19 @@ def init_db():
             is_started INTEGER DEFAULT 0,
             is_ranking_open INTEGER DEFAULT 0,
             active_worksheet_id INTEGER,
+            active_mode TEXT DEFAULT 'quiz',
             created_at TEXT
         )
+        """))
+
+        conn.execute(text("""
+        ALTER TABLE classes
+        ADD COLUMN IF NOT EXISTS active_worksheet_id INTEGER
+        """))
+
+        conn.execute(text("""
+        ALTER TABLE classes
+        ADD COLUMN IF NOT EXISTS active_mode TEXT DEFAULT 'quiz'
         """))
 
         conn.execute(text("""
@@ -120,6 +120,20 @@ def init_db():
         )
         """))
 
+        conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS photo_uploads (
+            id SERIAL PRIMARY KEY,
+            class_code TEXT,
+            student_key TEXT,
+            student_name TEXT,
+            team_name TEXT,
+            image_data BYTEA,
+            caption TEXT,
+            uploaded_at TEXT,
+            UNIQUE(class_code, student_key)
+        )
+        """))
+
 
 def create_class(class_name):
     class_code = str(uuid.uuid4())[:6].upper()
@@ -129,18 +143,14 @@ def create_class(class_name):
         conn.execute(text("""
         INSERT INTO classes (
             class_code, class_name, is_started, is_ranking_open,
-            active_worksheet_id, created_at
+            active_worksheet_id, active_mode, created_at
         )
         VALUES (
-            :class_code, :class_name, :is_started, :is_ranking_open,
-            :active_worksheet_id, :created_at
+            :class_code, :class_name, 0, 0, NULL, 'quiz', :created_at
         )
         """), {
             "class_code": class_code,
             "class_name": class_name,
-            "is_started": 0,
-            "is_ranking_open": 0,
-            "active_worksheet_id": None,
             "created_at": datetime.now().isoformat(),
         })
 
@@ -149,50 +159,31 @@ def create_class(class_name):
 
 def get_classes():
     engine = get_engine()
-
     with engine.connect() as conn:
-        df = pd.read_sql_query(
-            text("SELECT * FROM classes ORDER BY created_at DESC"),
-            conn
-        )
-
-    return df
+        return pd.read_sql_query(text("SELECT * FROM classes ORDER BY created_at DESC"), conn)
 
 
 def add_team(class_code, team_name):
     engine = get_engine()
-
     with engine.begin() as conn:
         conn.execute(text("""
         INSERT INTO teams (class_code, team_name)
         VALUES (:class_code, :team_name)
-        """), {
-            "class_code": class_code,
-            "team_name": team_name,
-        })
+        """), {"class_code": class_code, "team_name": team_name})
 
 
 def get_teams(class_code):
     engine = get_engine()
-
     with engine.connect() as conn:
-        df = pd.read_sql_query(
-            text("""
-            SELECT *
-            FROM teams
-            WHERE class_code=:class_code
-            ORDER BY id ASC
-            """),
+        return pd.read_sql_query(
+            text("SELECT * FROM teams WHERE class_code=:class_code ORDER BY id ASC"),
             conn,
             params={"class_code": class_code}
         )
 
-    return df
-
 
 def create_worksheet(class_code, worksheet_title):
     engine = get_engine()
-
     with engine.begin() as conn:
         conn.execute(text("""
         INSERT INTO worksheets (class_code, worksheet_title, created_at)
@@ -206,137 +197,125 @@ def create_worksheet(class_code, worksheet_title):
 
 def get_worksheets(class_code):
     engine = get_engine()
-
     with engine.connect() as conn:
-        df = pd.read_sql_query(
-            text("""
-            SELECT *
-            FROM worksheets
-            WHERE class_code=:class_code
-            ORDER BY id ASC
-            """),
+        return pd.read_sql_query(
+            text("SELECT * FROM worksheets WHERE class_code=:class_code ORDER BY id ASC"),
             conn,
             params={"class_code": class_code}
         )
 
-    return df
-
 
 def set_active_worksheet(class_code, worksheet_id):
     engine = get_engine()
-
     with engine.begin() as conn:
         conn.execute(text("""
         UPDATE classes
         SET active_worksheet_id=:worksheet_id
         WHERE class_code=:class_code
-        """), {
-            "worksheet_id": int(worksheet_id),
-            "class_code": class_code,
-        })
+        """), {"worksheet_id": int(worksheet_id), "class_code": class_code})
 
 
 def get_active_worksheet(class_code):
     engine = get_engine()
-
     with engine.connect() as conn:
         row = conn.execute(text("""
         SELECT w.*
         FROM classes c
         JOIN worksheets w ON c.active_worksheet_id = w.id
         WHERE c.class_code=:class_code
-        """), {
-            "class_code": class_code,
-        }).mappings().fetchone()
+        """), {"class_code": class_code}).mappings().fetchone()
 
     return row_to_dict(row) if row else None
 
 
+def set_class_mode(class_code, mode):
+    engine = get_engine()
+    with engine.begin() as conn:
+        conn.execute(text("""
+        UPDATE classes
+        SET active_mode=:mode
+        WHERE class_code=:class_code
+        """), {"mode": mode, "class_code": class_code})
+
+
+def get_class_mode(class_code):
+    engine = get_engine()
+    with engine.connect() as conn:
+        row = conn.execute(text("""
+        SELECT active_mode
+        FROM classes
+        WHERE class_code=:class_code
+        """), {"class_code": class_code}).fetchone()
+
+    return row[0] if row and row[0] else "quiz"
+
+
 def start_class(class_code):
     engine = get_engine()
-
     with engine.begin() as conn:
         conn.execute(text("""
         UPDATE classes
         SET is_started=1
         WHERE class_code=:class_code
-        """), {
-            "class_code": class_code,
-        })
+        """), {"class_code": class_code})
 
 
 def reset_class_start(class_code):
     engine = get_engine()
-
     with engine.begin() as conn:
         conn.execute(text("""
         UPDATE classes
         SET is_started=0
         WHERE class_code=:class_code
-        """), {
-            "class_code": class_code,
-        })
+        """), {"class_code": class_code})
 
 
 def is_class_started(class_code):
     engine = get_engine()
-
     with engine.connect() as conn:
         row = conn.execute(text("""
         SELECT is_started
         FROM classes
         WHERE class_code=:class_code
-        """), {
-            "class_code": class_code,
-        }).fetchone()
+        """), {"class_code": class_code}).fetchone()
 
     return bool(row and row[0] == 1)
 
 
 def open_ranking(class_code):
     engine = get_engine()
-
     with engine.begin() as conn:
         conn.execute(text("""
         UPDATE classes
         SET is_ranking_open=1
         WHERE class_code=:class_code
-        """), {
-            "class_code": class_code,
-        })
+        """), {"class_code": class_code})
 
 
 def close_ranking(class_code):
     engine = get_engine()
-
     with engine.begin() as conn:
         conn.execute(text("""
         UPDATE classes
         SET is_ranking_open=0
         WHERE class_code=:class_code
-        """), {
-            "class_code": class_code,
-        })
+        """), {"class_code": class_code})
 
 
 def is_ranking_open(class_code):
     engine = get_engine()
-
     with engine.connect() as conn:
         row = conn.execute(text("""
         SELECT is_ranking_open
         FROM classes
         WHERE class_code=:class_code
-        """), {
-            "class_code": class_code,
-        }).fetchone()
+        """), {"class_code": class_code}).fetchone()
 
     return bool(row and row[0] == 1)
 
 
 def join_class(class_code, student_key, student_name, team_name):
     engine = get_engine()
-
     with engine.begin() as conn:
         conn.execute(text("""
         INSERT INTO participants (
@@ -346,8 +325,7 @@ def join_class(class_code, student_key, student_name, team_name):
             :class_code, :student_key, :student_name, :team_name, :joined_at
         )
         ON CONFLICT(class_code, student_key)
-        DO UPDATE SET
-            student_name=EXCLUDED.student_name
+        DO UPDATE SET student_name=EXCLUDED.student_name
         """), {
             "class_code": class_code,
             "student_key": student_key,
@@ -359,7 +337,6 @@ def join_class(class_code, student_key, student_name, team_name):
 
 def get_participant(class_code, student_key):
     engine = get_engine()
-
     with engine.connect() as conn:
         row = conn.execute(text("""
         SELECT *
@@ -375,20 +352,12 @@ def get_participant(class_code, student_key):
 
 def get_participants(class_code):
     engine = get_engine()
-
     with engine.connect() as conn:
-        df = pd.read_sql_query(
-            text("""
-            SELECT *
-            FROM participants
-            WHERE class_code=:class_code
-            ORDER BY joined_at ASC
-            """),
+        return pd.read_sql_query(
+            text("SELECT * FROM participants WHERE class_code=:class_code ORDER BY joined_at ASC"),
             conn,
             params={"class_code": class_code}
         )
-
-    return df
 
 
 def save_question(
@@ -403,7 +372,6 @@ def save_question(
     image_data
 ):
     engine = get_engine()
-
     with engine.begin() as conn:
         conn.execute(text("""
         INSERT INTO questions (
@@ -436,7 +404,6 @@ def save_question(
 
 def get_questions(class_code, worksheet_id):
     engine = get_engine()
-
     with engine.connect() as conn:
         rows = conn.execute(text("""
         SELECT *
@@ -453,12 +420,8 @@ def get_questions(class_code, worksheet_id):
 
 def delete_question(question_id):
     engine = get_engine()
-
     with engine.begin() as conn:
-        conn.execute(text("""
-        DELETE FROM questions
-        WHERE id=:question_id
-        """), {
+        conn.execute(text("DELETE FROM questions WHERE id=:question_id"), {
             "question_id": int(question_id),
         })
 
@@ -488,7 +451,6 @@ def grade_answers(class_code, worksheet_id, student_answers):
 
 def already_submitted(class_code, worksheet_id, student_key):
     engine = get_engine()
-
     with engine.connect() as conn:
         count = conn.execute(text("""
         SELECT COUNT(*)
@@ -545,7 +507,6 @@ def submit_answers(class_code, worksheet_id, student_key, student_name, team_nam
 
 def get_submission(class_code, worksheet_id, student_key):
     engine = get_engine()
-
     with engine.connect() as conn:
         row = conn.execute(text("""
         SELECT *
@@ -564,9 +525,8 @@ def get_submission(class_code, worksheet_id, student_key):
 
 def get_submissions(class_code, worksheet_id):
     engine = get_engine()
-
     with engine.connect() as conn:
-        df = pd.read_sql_query(
+        return pd.read_sql_query(
             text("""
             SELECT *
             FROM submissions
@@ -574,13 +534,8 @@ def get_submissions(class_code, worksheet_id):
             ORDER BY submitted_at ASC
             """),
             conn,
-            params={
-                "class_code": class_code,
-                "worksheet_id": int(worksheet_id),
-            }
+            params={"class_code": class_code, "worksheet_id": int(worksheet_id)}
         )
-
-    return df
 
 
 def get_team_ranking(class_code, worksheet_id):
@@ -600,8 +555,7 @@ def get_team_ranking(class_code, worksheet_id):
     speed_map = {}
 
     for idx, row in team_order.iterrows():
-        order = idx + 1
-        speed_map[row["team_name"]] = calculate_speed_score(order)
+        speed_map[row["team_name"]] = calculate_speed_score(idx + 1)
 
     team_scores = (
         submissions
@@ -625,3 +579,61 @@ def get_team_ranking(class_code, worksheet_id):
     team_scores["순위"] = team_scores.index + 1
 
     return team_scores
+
+
+def save_photo_upload(class_code, student_key, student_name, team_name, image_data, caption):
+    engine = get_engine()
+    with engine.begin() as conn:
+        conn.execute(text("""
+        INSERT INTO photo_uploads (
+            class_code, student_key, student_name, team_name,
+            image_data, caption, uploaded_at
+        )
+        VALUES (
+            :class_code, :student_key, :student_name, :team_name,
+            :image_data, :caption, :uploaded_at
+        )
+        ON CONFLICT(class_code, student_key)
+        DO UPDATE SET
+            student_name=EXCLUDED.student_name,
+            team_name=EXCLUDED.team_name,
+            image_data=EXCLUDED.image_data,
+            caption=EXCLUDED.caption,
+            uploaded_at=EXCLUDED.uploaded_at
+        """), {
+            "class_code": class_code,
+            "student_key": student_key,
+            "student_name": student_name,
+            "team_name": team_name,
+            "image_data": image_data,
+            "caption": caption,
+            "uploaded_at": datetime.now().isoformat(),
+        })
+
+
+def get_photo_uploads(class_code):
+    engine = get_engine()
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+        SELECT *
+        FROM photo_uploads
+        WHERE class_code=:class_code
+        ORDER BY uploaded_at DESC
+        """), {"class_code": class_code}).mappings().all()
+
+    return [row_to_dict(row) for row in rows]
+
+
+def get_photo_upload(class_code, student_key):
+    engine = get_engine()
+    with engine.connect() as conn:
+        row = conn.execute(text("""
+        SELECT *
+        FROM photo_uploads
+        WHERE class_code=:class_code AND student_key=:student_key
+        """), {
+            "class_code": class_code,
+            "student_key": student_key,
+        }).mappings().fetchone()
+
+    return row_to_dict(row) if row else None
