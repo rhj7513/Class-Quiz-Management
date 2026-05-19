@@ -447,7 +447,7 @@ def render_student_page(class_code):
         st.session_state.submitted = False
 
     if st.session_state.student_ready:
-        st_autorefresh(interval=7000, key="student_auto_refresh")
+        st_autorefresh(interval=12000, key="student_auto_refresh")
 
     st.title("👩‍🎓 학생 화면")
 
