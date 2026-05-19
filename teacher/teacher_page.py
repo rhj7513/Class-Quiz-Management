@@ -22,6 +22,9 @@ from server.database import (
     open_ranking,
     close_ranking,
     is_ranking_open,
+    set_class_mode,
+    get_class_mode,
+    get_photo_uploads,
 )
 
 from server.qr_utils import make_qr
