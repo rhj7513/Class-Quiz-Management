@@ -13,6 +13,11 @@ from server.database import (
     get_teams,
     already_submitted,
     get_active_worksheet,
+    get_submission,
+    get_class_mode,
+    save_photo_upload,
+    get_photo_uploads,
+    get_photo_upload,
 )
 
 
@@ -67,7 +72,7 @@ def render_podium(team_rank):
             width: 100%;
             display: flex;
             justify-content: center;
-            align-items: flex-end;
+            align-items: flex-start;
             gap: 28px;
             padding: 28px 8px 24px;
             margin: 10px 0 26px;
@@ -105,14 +110,14 @@ def render_podium(team_rank):
             width: 185px;
             height: 185px;
             background: radial-gradient(circle at 35% 25%, #ffffff 0%, #d1d5db 42%, #94a3b8 100%);
-            margin-bottom: 15px;
+            margin-top: 42px;
         }}
 
         .rank-3 .podium-circle {{
             width: 165px;
             height: 165px;
             background: radial-gradient(circle at 35% 25%, #fed7aa 0%, #fb923c 43%, #c2410c 100%);
-            margin-bottom: 28px;
+            margin-top: 74px;
         }}
 
         .podium-medal {{
@@ -189,13 +194,13 @@ def render_podium(team_rank):
             .rank-2 .podium-circle {{
                 width: 112px;
                 height: 112px;
-                margin-bottom: 18px;
+                margin-top: 24px;
             }}
 
             .rank-3 .podium-circle {{
                 width: 104px;
                 height: 104px;
-                margin-bottom: 6px;
+                margin-top: 42px;
             }}
 
             .podium-medal,
@@ -253,11 +258,59 @@ def render_podium(team_rank):
     )
 
 
-def render_worksheet_review(questions):
+def parse_submission_answers(submission):
+    if not submission:
+        return {}
+
+    answers_text = submission["answers_text"] or ""
+    lines = answers_text.splitlines()
+
+    parsed = {}
+
+    for idx, line in enumerate(lines, start=1):
+        parts = [part.strip() for part in line.split("|")]
+
+        student_answer = ""
+        correct_answer = ""
+        result = ""
+
+        for part in parts:
+            if part.startswith("학생 답:"):
+                student_answer = part.replace("학생 답:", "").strip()
+            elif part.startswith("정답:"):
+                correct_answer = part.replace("정답:", "").strip()
+            elif part in ["정답", "오답"]:
+                result = part
+
+        parsed[idx] = {
+            "student_answer": student_answer,
+            "correct_answer": correct_answer,
+            "result": result,
+        }
+
+    return parsed
+
+
+def render_answer_result(student_answer, correct_answer, result):
+    if result == "정답":
+        st.success(f"내 답: {student_answer}  |  정답: {correct_answer}  |  결과: 정답")
+    else:
+        st.error(f"내 답: {student_answer}  |  정답: {correct_answer}  |  결과: 오답")
+
+
+def render_worksheet_review(questions, submission):
+    answer_map = parse_submission_answers(submission)
+
     st.divider()
     st.header("📘 활동지 전체 보기")
 
     for idx, q in enumerate(questions, start=1):
+        answer_info = answer_map.get(idx, {})
+
+        student_answer = str(answer_info.get("student_answer", ""))
+        correct_answer = str(answer_info.get("correct_answer", q["correct_answer"]))
+        result = answer_info.get("result", "")
+
         st.divider()
 
         st.subheader(f"{idx}. {q['question_title']} ({q['score']}점)")
@@ -269,14 +322,27 @@ def render_worksheet_review(questions):
         st.caption(f"문제 유형: {q['question_type']}")
 
         if q["question_type"] == "OX":
-            st.write("선택지")
-            st.write("O")
-            st.write("X")
-            st.success(f"정답: {q['correct_answer']}")
+            col1, col2 = st.columns(2)
+
+            with col1:
+                if student_answer == "O":
+                    st.info("내 선택: O")
+                elif correct_answer == "O":
+                    st.success("정답: O")
+                else:
+                    st.write("O")
+
+            with col2:
+                if student_answer == "X":
+                    st.info("내 선택: X")
+                elif correct_answer == "X":
+                    st.success("정답: X")
+                else:
+                    st.write("X")
+
+            render_answer_result(student_answer, correct_answer, result)
 
         elif q["question_type"] == "5지선다":
-            st.write("선택지")
-
             choices = {
                 "1": q["choice_1"],
                 "2": q["choice_2"],
@@ -285,17 +351,92 @@ def render_worksheet_review(questions):
                 "5": q["choice_5"],
             }
 
+            st.write("선택지")
+
             for number, text in choices.items():
-                if number == str(q["correct_answer"]):
-                    st.success(f"{number}. {text}")
+                labels = []
+
+                if number == student_answer:
+                    labels.append("내 선택")
+
+                if number == correct_answer:
+                    labels.append("정답")
+
+                label_text = f" ({', '.join(labels)})" if labels else ""
+
+                if number == correct_answer:
+                    st.success(f"{number}. {text}{label_text}")
+                elif number == student_answer:
+                    st.error(f"{number}. {text}{label_text}")
                 else:
                     st.write(f"{number}. {text}")
 
-            correct_text = choices.get(str(q["correct_answer"]), "")
-            st.success(f"정답: {q['correct_answer']}번 {correct_text}")
+            render_answer_result(student_answer, correct_answer, result)
 
         else:
-            st.success(f"예시 정답: {q['correct_answer']}")
+            st.write(f"내 답: {student_answer}")
+            st.success(f"예시 정답: {correct_answer}")
+
+            if result == "정답":
+                st.success("결과: 정답")
+            else:
+                st.error("결과: 오답")
+
+
+def render_photo_page(class_code):
+    st.header("📸 사진 올리기")
+    st.info("선생님이 사진 올리기 활동을 시작했습니다.")
+
+    my_photo = get_photo_upload(
+        class_code,
+        st.session_state.student_key
+    )
+
+    if my_photo:
+        st.success("이미 사진을 올렸습니다. 다시 올리면 기존 사진이 바뀝니다.")
+        st.image(my_photo["image_data"], caption="내가 올린 사진", width=350)
+
+    image_file = st.camera_input("사진 찍기")
+
+    if image_file is None:
+        image_file = st.file_uploader(
+            "또는 사진 파일 올리기",
+            type=["png", "jpg", "jpeg"]
+        )
+
+    caption = st.text_input("사진 설명", placeholder="예: 우리 팀 활동 결과")
+
+    if st.button("사진 제출하기"):
+        if image_file is None:
+            st.error("사진을 찍거나 파일을 올려주세요.")
+        else:
+            save_photo_upload(
+                class_code,
+                st.session_state.student_key,
+                st.session_state.student_name,
+                st.session_state.team_name,
+                image_file.getvalue(),
+                caption
+            )
+            st.success("사진 제출 완료!")
+            st.rerun()
+
+    st.divider()
+    st.header("친구들이 올린 사진")
+
+    photos = get_photo_uploads(class_code)
+
+    if len(photos) == 0:
+        st.info("아직 올라온 사진이 없습니다.")
+    else:
+        cols = st.columns(2)
+
+        for idx, photo in enumerate(photos):
+            with cols[idx % 2]:
+                st.image(photo["image_data"], use_container_width=True)
+                st.write(f"{photo['team_name']}팀 - {photo['student_name']}")
+                if photo["caption"]:
+                    st.caption(photo["caption"])
 
 
 def render_student_page(class_code):
@@ -361,13 +502,19 @@ def render_student_page(class_code):
         st.success(f"{st.session_state.team_name}팀 입장 완료!")
 
         st.header("⏳ 대기 화면")
-        st.info("아직 선생님이 문제 풀이를 시작하지 않았습니다.")
+        st.info("아직 선생님이 활동을 시작하지 않았습니다.")
 
         st.write(f"학급반 번호: {st.session_state.student_number}")
         st.write(f"이름: {st.session_state.student_name}")
         st.write(f"팀: {st.session_state.team_name}")
 
-        st.caption("선생님이 시작 버튼을 누르면 자동으로 문제 화면으로 이동합니다.")
+        st.caption("선생님이 시작 버튼을 누르면 자동으로 활동 화면으로 이동합니다.")
+        return
+
+    active_mode = get_class_mode(class_code)
+
+    if active_mode == "photo":
+        render_photo_page(class_code)
         return
 
     active_worksheet = get_active_worksheet(class_code)
@@ -409,7 +556,13 @@ def render_student_page(class_code):
         team_rank = get_team_ranking(class_code, worksheet_id)
         render_podium(team_rank)
 
-        render_worksheet_review(questions)
+        submission = get_submission(
+            class_code,
+            worksheet_id,
+            st.session_state.student_key
+        )
+
+        render_worksheet_review(questions, submission)
         return
 
     st.success("문제 풀이 시작!")
