@@ -10,6 +10,7 @@ from server.database import (
     get_worksheets,
     set_active_worksheet,
     get_active_worksheet,
+    set_class_mode,
     save_question,
     get_questions,
     delete_question,
@@ -22,12 +23,14 @@ from server.database import (
     open_ranking,
     close_ranking,
     is_ranking_open,
-    set_class_mode,
-    get_class_mode,
     get_photo_uploads,
 )
 
 from server.qr_utils import make_qr
+
+
+def csv_data(df):
+    return df.to_csv(index=False).encode("utf-8-sig")
 
 
 def render_teacher_page():
@@ -58,7 +61,19 @@ def render_teacher_page():
                 st.success(f"클래스 생성 완료! 클래스 코드: {class_code}")
 
         st.subheader("생성된 클래스")
-        st.dataframe(get_classes(), use_container_width=True)
+        classes_df = get_classes()
+
+        if len(classes_df) == 0:
+            st.info("아직 생성된 클래스가 없습니다.")
+        else:
+            st.dataframe(classes_df, use_container_width=True)
+
+            st.download_button(
+                "클래스 목록 CSV 다운로드",
+                data=csv_data(classes_df),
+                file_name="classes.csv",
+                mime="text/csv",
+            )
 
     elif menu == "팀 설정":
         st.header("2️⃣ 팀 설정")
@@ -94,9 +109,15 @@ def render_teacher_page():
         if len(teams) == 0:
             st.info("아직 생성된 팀이 없습니다.")
         else:
-            st.dataframe(
-                teams[["team_name"]].rename(columns={"team_name": "팀 이름"}),
-                use_container_width=True
+            team_df = teams[["team_name"]].rename(columns={"team_name": "팀 이름"})
+
+            st.dataframe(team_df, use_container_width=True)
+
+            st.download_button(
+                "팀 목록 CSV 다운로드",
+                data=csv_data(team_df),
+                file_name=f"{selected_class}_teams.csv",
+                mime="text/csv",
             )
 
     elif menu == "활동지 만들기":
@@ -132,6 +153,13 @@ def render_teacher_page():
         if len(worksheets) == 0:
             st.info("먼저 학습지를 만들어주세요.")
             return
+
+        st.download_button(
+            "학습지 목록 CSV 다운로드",
+            data=csv_data(worksheets),
+            file_name=f"{selected_class}_worksheets.csv",
+            mime="text/csv",
+        )
 
         selected_worksheet = st.selectbox(
             "문제를 넣을 학습지 선택",
@@ -249,40 +277,43 @@ def render_teacher_page():
 
         st.divider()
 
+        deployed_url = "https://class-quiz-management-kdowbtatpzku2fbn73ypdm.streamlit.app"
+
         current_url = streamlit_js_eval(
             js_expressions="window.location.origin",
-            key="get_current_url"
+            key="get_current_url_v2"
         )
 
-        base_url = st.text_input(
-            "배포 주소 또는 현재 주소",
-            value=current_url or "",
-            placeholder="예: https://example.streamlit.app"
+        if current_url and "localhost" not in current_url and "127.0.0.1" not in current_url:
+            base_url = current_url.rstrip("/")
+        else:
+            base_url = deployed_url.rstrip("/")
+
+        student_url = f"{base_url}?class_code={selected_class}"
+
+        st.subheader("학생 입장 주소")
+        st.code(student_url)
+
+        if "localhost" in student_url or "127.0.0.1" in student_url:
+            st.error("학생 주소에 localhost가 들어가 있습니다. 배포 주소로 다시 생성해주세요.")
+            return
+
+        st.markdown(
+            f"""
+            <input type="text" value="{student_url}" id="copyTarget" style="width:100%;padding:8px;">
+            <button onclick="
+                navigator.clipboard.writeText(document.getElementById('copyTarget').value);
+                alert('주소가 복사되었습니다!');
+            ">
+            주소 복사하기
+            </button>
+            """,
+            unsafe_allow_html=True
         )
 
-        if base_url:
-            base_url = base_url.rstrip("/")
-            student_url = f"{base_url}?class_code={selected_class}"
-
-            st.subheader("학생 입장 주소")
-            st.code(student_url)
-
-            st.markdown(
-                f"""
-                <input type="text" value="{student_url}" id="copyTarget" style="width:100%;padding:8px;">
-                <button onclick="
-                    navigator.clipboard.writeText(document.getElementById('copyTarget').value);
-                    alert('주소가 복사되었습니다!');
-                ">
-                주소 복사하기
-                </button>
-                """,
-                unsafe_allow_html=True
-            )
-
-            st.subheader("학생 입장 QR 코드")
-            qr_image = make_qr(student_url)
-            st.image(qr_image, width=280)
+        st.subheader("학생 입장 QR 코드")
+        qr_image = make_qr(student_url)
+        st.image(qr_image, width=280)
 
     elif menu == "대기실 관리":
         st.header("5️⃣ 대기실 관리")
@@ -290,6 +321,7 @@ def render_teacher_page():
         classes = get_classes()
 
         if len(classes) == 0:
+            st.warning("먼저 클래스를 생성해주세요.")
             return
 
         selected_class = st.selectbox("클래스 선택", classes["class_code"].tolist())
@@ -314,7 +346,7 @@ def render_teacher_page():
         started = is_class_started(selected_class)
 
         if started:
-            st.success("현재 문제 풀이 진행 중")
+            st.success("현재 활동 진행 중")
         else:
             st.info("현재 학생 대기 중")
 
@@ -323,30 +355,47 @@ def render_teacher_page():
         st.metric("입장 학생 수", len(participants))
 
         if len(participants) > 0:
-            st.dataframe(
-                participants[[
-                    "team_name",
-                    "student_name",
-                    "joined_at"
-                ]].rename(columns={
-                    "team_name": "팀",
-                    "student_name": "학생",
-                    "joined_at": "입장 시간"
-                }),
-                use_container_width=True
+            participant_df = participants[[
+                "team_name",
+                "student_name",
+                "joined_at"
+            ]].rename(columns={
+                "team_name": "팀",
+                "student_name": "학생",
+                "joined_at": "입장 시간"
+            })
+
+            st.dataframe(participant_df, use_container_width=True)
+
+            st.download_button(
+                "입장 학생 명단 CSV 다운로드",
+                data=csv_data(participant_df),
+                file_name=f"{selected_class}_participants.csv",
+                mime="text/csv",
             )
 
-        col1, col2 = st.columns(2)
+        st.divider()
+
+        col1, col2, col3 = st.columns(3)
 
         with col1:
             if st.button("문제 풀이 시작하기"):
                 set_active_worksheet(selected_class, selected_worksheet)
+                set_class_mode(selected_class, "quiz")
                 close_ranking(selected_class)
                 start_class(selected_class)
                 st.success("문제 풀이 시작!")
                 st.rerun()
 
         with col2:
+            if st.button("사진 올리기 시작하기"):
+                set_class_mode(selected_class, "photo")
+                close_ranking(selected_class)
+                start_class(selected_class)
+                st.success("사진 올리기 화면으로 전환되었습니다.")
+                st.rerun()
+
+        with col3:
             if st.button("다시 대기 상태로"):
                 reset_class_start(selected_class)
                 close_ranking(selected_class)
@@ -359,6 +408,7 @@ def render_teacher_page():
         classes = get_classes()
 
         if len(classes) == 0:
+            st.warning("먼저 클래스를 생성해주세요.")
             return
 
         selected_class = st.selectbox("클래스 선택", classes["class_code"].tolist())
@@ -405,35 +455,72 @@ def render_teacher_page():
         else:
             st.subheader("개인 제출 현황")
 
-            st.dataframe(
-                df[[
-                    "team_name",
-                    "student_name",
-                    "submitted_at",
-                    "accuracy_score"
-                ]].rename(columns={
-                    "team_name": "팀",
-                    "student_name": "학생",
-                    "submitted_at": "제출 시간",
-                    "accuracy_score": "점수"
-                }),
-                use_container_width=True
+            submission_df = df[[
+                "team_name",
+                "student_name",
+                "submitted_at",
+                "accuracy_score",
+                "answers_text"
+            ]].rename(columns={
+                "team_name": "팀",
+                "student_name": "학생",
+                "submitted_at": "제출 시간",
+                "accuracy_score": "점수",
+                "answers_text": "답안 내용"
+            })
+
+            st.dataframe(submission_df, use_container_width=True)
+
+            st.download_button(
+                "개인 제출 결과 CSV 다운로드",
+                data=csv_data(submission_df),
+                file_name=f"{selected_class}_{selected_worksheet}_submissions.csv",
+                mime="text/csv",
             )
 
             st.subheader("팀 순위")
 
             team_rank = get_team_ranking(selected_class, selected_worksheet)
 
-            st.dataframe(
-                team_rank[[
-                    "순위",
-                    "team_name",
-                    "제출인원",
-                    "정확도점수",
-                    "속도점수",
-                    "총점"
-                ]].rename(columns={
-                    "team_name": "팀"
-                }),
-                use_container_width=True
+            rank_df = team_rank[[
+                "순위",
+                "team_name",
+                "제출인원",
+                "정확도점수",
+                "속도점수",
+                "총점"
+            ]].rename(columns={
+                "team_name": "팀"
+            })
+
+            st.dataframe(rank_df, use_container_width=True)
+
+            st.download_button(
+                "팀 순위 CSV 다운로드",
+                data=csv_data(rank_df),
+                file_name=f"{selected_class}_{selected_worksheet}_team_ranking.csv",
+                mime="text/csv",
             )
+
+        st.divider()
+        st.subheader("학생 사진 제출 현황")
+
+        photos = get_photo_uploads(selected_class)
+
+        if len(photos) == 0:
+            st.info("아직 학생들이 올린 사진이 없습니다.")
+        else:
+            st.success(f"총 {len(photos)}개의 사진이 올라왔습니다.")
+
+            cols = st.columns(3)
+
+            for idx, photo in enumerate(photos):
+                with cols[idx % 3]:
+                    st.image(photo["image_data"], use_container_width=True)
+                    st.write(f"학생: {photo['student_name']}")
+                    st.write(f"팀: {photo['team_name']}")
+
+                    if photo["caption"]:
+                        st.caption(photo["caption"])
+
+                    st.caption(photo["uploaded_at"])
