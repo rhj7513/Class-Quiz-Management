@@ -440,15 +440,16 @@ def render_photo_page(class_code):
 
 
 def render_student_page(class_code):
-    st_autorefresh(interval=10000, key="student_auto_refresh")
-
-    st.title("👩‍🎓 학생 화면")
-
     if "student_ready" not in st.session_state:
         st.session_state.student_ready = False
 
     if "submitted" not in st.session_state:
         st.session_state.submitted = False
+
+    if st.session_state.student_ready:
+        st_autorefresh(interval=7000, key="student_auto_refresh")
+
+    st.title("👩‍🎓 학생 화면")
 
     if not st.session_state.student_ready:
         st.header("입장하기")
