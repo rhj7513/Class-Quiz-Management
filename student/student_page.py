@@ -440,7 +440,7 @@ def render_photo_page(class_code):
 
 
 def render_student_page(class_code):
-    st_autorefresh(interval=2000, key="student_auto_refresh")
+    st_autorefresh(interval=10000, key="student_auto_refresh")
 
     st.title("👩‍🎓 학생 화면")
 
