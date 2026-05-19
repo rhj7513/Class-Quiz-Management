@@ -1,115 +1,113 @@
-import sqlite3
+import os
 import uuid
 import pandas as pd
+import streamlit as st
 from datetime import datetime
+from sqlalchemy import create_engine, text
 from server.scoring import calculate_speed_score
 
-DB_PATH = "class_quiz.db"
+DB_PATH = ""
 
 
-def get_conn():
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+def get_database_url():
+    database_url = st.secrets.get("DATABASE_URL", None)
+
+    if not database_url:
+        database_url = os.environ.get("DATABASE_URL")
+
+    if not database_url:
+        raise RuntimeError("DATABASE_URL이 설정되지 않았습니다. Streamlit Secrets를 확인해주세요.")
+
+    if database_url.startswith("postgres://"):
+        database_url = database_url.replace("postgres://", "postgresql://", 1)
+
+    return database_url
+
+
+def get_engine():
+    return create_engine(
+        get_database_url(),
+        pool_pre_ping=True,
+        pool_recycle=300,
+    )
+
+
+def row_to_dict(row):
+    data = dict(row)
+
+    if "image_data" in data and isinstance(data["image_data"], memoryview):
+        data["image_data"] = bytes(data["image_data"])
+
+    return data
 
 
 def init_db():
-    conn = get_conn()
-    cur = conn.cursor()
+    engine = get_engine()
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS classes (
-        class_code TEXT PRIMARY KEY,
-        class_name TEXT,
-        is_started INTEGER DEFAULT 0,
-        is_ranking_open INTEGER DEFAULT 0,
-        created_at TEXT
-    )
-    """)
+    with engine.begin() as conn:
+        conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS classes (
+            class_code TEXT PRIMARY KEY,
+            class_name TEXT,
+            is_started INTEGER DEFAULT 0,
+            is_ranking_open INTEGER DEFAULT 0,
+            active_worksheet_id INTEGER,
+            created_at TEXT
+        )
+        """))
 
-    cur.execute("PRAGMA table_info(classes)")
-    class_columns = [row[1] for row in cur.fetchall()]
+        conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS teams (
+            id SERIAL PRIMARY KEY,
+            class_code TEXT,
+            team_name TEXT
+        )
+        """))
 
-    if "active_worksheet_id" not in class_columns:
-        cur.execute("ALTER TABLE classes ADD COLUMN active_worksheet_id INTEGER")
+        conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS worksheets (
+            id SERIAL PRIMARY KEY,
+            class_code TEXT,
+            worksheet_title TEXT,
+            created_at TEXT
+        )
+        """))
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS teams (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        class_code TEXT,
-        team_name TEXT
-    )
-    """)
+        conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS participants (
+            id SERIAL PRIMARY KEY,
+            class_code TEXT,
+            student_key TEXT,
+            student_name TEXT,
+            team_name TEXT,
+            joined_at TEXT,
+            UNIQUE(class_code, student_key)
+        )
+        """))
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS worksheets (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        class_code TEXT,
-        worksheet_title TEXT,
-        created_at TEXT
-    )
-    """)
+        conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS questions (
+            id SERIAL PRIMARY KEY,
+            class_code TEXT,
+            worksheet_id INTEGER,
+            question_title TEXT,
+            question_text TEXT,
+            question_type TEXT,
+            choice_1 TEXT,
+            choice_2 TEXT,
+            choice_3 TEXT,
+            choice_4 TEXT,
+            choice_5 TEXT,
+            correct_answer TEXT,
+            score INTEGER,
+            image_data BYTEA,
+            created_at TEXT
+        )
+        """))
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS participants (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        class_code TEXT,
-        student_key TEXT,
-        student_name TEXT,
-        team_name TEXT,
-        joined_at TEXT,
-        UNIQUE(class_code, student_key)
-    )
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS questions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        class_code TEXT,
-        worksheet_id INTEGER,
-        question_title TEXT,
-        question_text TEXT,
-        question_type TEXT,
-        choice_1 TEXT,
-        choice_2 TEXT,
-        choice_3 TEXT,
-        choice_4 TEXT,
-        choice_5 TEXT,
-        correct_answer TEXT,
-        score INTEGER,
-        image_data BLOB,
-        created_at TEXT
-    )
-    """)
-
-    cur.execute("PRAGMA table_info(questions)")
-    question_columns = [row[1] for row in cur.fetchall()]
-
-    if "worksheet_id" not in question_columns:
-        cur.execute("ALTER TABLE questions ADD COLUMN worksheet_id INTEGER")
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS submissions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        class_code TEXT,
-        worksheet_id INTEGER,
-        student_key TEXT,
-        student_name TEXT,
-        team_name TEXT,
-        answers_text TEXT,
-        submitted_at TEXT,
-        accuracy_score INTEGER,
-        UNIQUE(class_code, worksheet_id, student_key)
-    )
-    """)
-
-    cur.execute("PRAGMA table_info(submissions)")
-    submission_columns = [row[1] for row in cur.fetchall()]
-
-    if "worksheet_id" not in submission_columns:
-        cur.execute("ALTER TABLE submissions RENAME TO submissions_old")
-
-        cur.execute("""
-        CREATE TABLE submissions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+        conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS submissions (
+            id SERIAL PRIMARY KEY,
             class_code TEXT,
             worksheet_id INTEGER,
             student_key TEXT,
@@ -120,262 +118,276 @@ def init_db():
             accuracy_score INTEGER,
             UNIQUE(class_code, worksheet_id, student_key)
         )
-        """)
-
-        cur.execute("""
-        INSERT OR IGNORE INTO submissions (
-            class_code, worksheet_id, student_key, student_name, team_name,
-            answers_text, submitted_at, accuracy_score
-        )
-        SELECT
-            class_code, 0, student_key, student_name, team_name,
-            answers_text, submitted_at, accuracy_score
-        FROM submissions_old
-        """)
-
-        cur.execute("DROP TABLE submissions_old")
-
-    conn.commit()
-    conn.close()
+        """))
 
 
 def create_class(class_name):
     class_code = str(uuid.uuid4())[:6].upper()
-    conn = get_conn()
-    cur = conn.cursor()
+    engine = get_engine()
 
-    cur.execute("""
-    INSERT INTO classes (
-        class_code, class_name, is_started, is_ranking_open, created_at, active_worksheet_id
-    )
-    VALUES (?, ?, ?, ?, ?, ?)
-    """, (class_code, class_name, 0, 0, datetime.now().isoformat(), None))
+    with engine.begin() as conn:
+        conn.execute(text("""
+        INSERT INTO classes (
+            class_code, class_name, is_started, is_ranking_open,
+            active_worksheet_id, created_at
+        )
+        VALUES (
+            :class_code, :class_name, :is_started, :is_ranking_open,
+            :active_worksheet_id, :created_at
+        )
+        """), {
+            "class_code": class_code,
+            "class_name": class_name,
+            "is_started": 0,
+            "is_ranking_open": 0,
+            "active_worksheet_id": None,
+            "created_at": datetime.now().isoformat(),
+        })
 
-    conn.commit()
-    conn.close()
     return class_code
 
 
 def get_classes():
-    conn = get_conn()
-    df = pd.read_sql_query(
-        "SELECT * FROM classes ORDER BY created_at DESC",
-        conn
-    )
-    conn.close()
+    engine = get_engine()
+
+    with engine.connect() as conn:
+        df = pd.read_sql_query(
+            text("SELECT * FROM classes ORDER BY created_at DESC"),
+            conn
+        )
+
     return df
 
 
 def add_team(class_code, team_name):
-    conn = get_conn()
-    cur = conn.cursor()
+    engine = get_engine()
 
-    cur.execute("""
-    INSERT INTO teams (class_code, team_name)
-    VALUES (?, ?)
-    """, (class_code, team_name))
-
-    conn.commit()
-    conn.close()
+    with engine.begin() as conn:
+        conn.execute(text("""
+        INSERT INTO teams (class_code, team_name)
+        VALUES (:class_code, :team_name)
+        """), {
+            "class_code": class_code,
+            "team_name": team_name,
+        })
 
 
 def get_teams(class_code):
-    conn = get_conn()
-    df = pd.read_sql_query(
-        """
-        SELECT *
-        FROM teams
-        WHERE class_code=?
-        ORDER BY id ASC
-        """,
-        conn,
-        params=(class_code,)
-    )
-    conn.close()
+    engine = get_engine()
+
+    with engine.connect() as conn:
+        df = pd.read_sql_query(
+            text("""
+            SELECT *
+            FROM teams
+            WHERE class_code=:class_code
+            ORDER BY id ASC
+            """),
+            conn,
+            params={"class_code": class_code}
+        )
+
     return df
 
 
 def create_worksheet(class_code, worksheet_title):
-    conn = get_conn()
-    cur = conn.cursor()
+    engine = get_engine()
 
-    cur.execute("""
-    INSERT INTO worksheets (class_code, worksheet_title, created_at)
-    VALUES (?, ?, ?)
-    """, (class_code, worksheet_title, datetime.now().isoformat()))
-
-    conn.commit()
-    conn.close()
+    with engine.begin() as conn:
+        conn.execute(text("""
+        INSERT INTO worksheets (class_code, worksheet_title, created_at)
+        VALUES (:class_code, :worksheet_title, :created_at)
+        """), {
+            "class_code": class_code,
+            "worksheet_title": worksheet_title,
+            "created_at": datetime.now().isoformat(),
+        })
 
 
 def get_worksheets(class_code):
-    conn = get_conn()
-    df = pd.read_sql_query(
-        """
-        SELECT *
-        FROM worksheets
-        WHERE class_code=?
-        ORDER BY id ASC
-        """,
-        conn,
-        params=(class_code,)
-    )
-    conn.close()
+    engine = get_engine()
+
+    with engine.connect() as conn:
+        df = pd.read_sql_query(
+            text("""
+            SELECT *
+            FROM worksheets
+            WHERE class_code=:class_code
+            ORDER BY id ASC
+            """),
+            conn,
+            params={"class_code": class_code}
+        )
+
     return df
 
 
 def set_active_worksheet(class_code, worksheet_id):
-    conn = get_conn()
-    cur = conn.cursor()
+    engine = get_engine()
 
-    cur.execute("""
-    UPDATE classes
-    SET active_worksheet_id=?
-    WHERE class_code=?
-    """, (worksheet_id, class_code))
-
-    conn.commit()
-    conn.close()
+    with engine.begin() as conn:
+        conn.execute(text("""
+        UPDATE classes
+        SET active_worksheet_id=:worksheet_id
+        WHERE class_code=:class_code
+        """), {
+            "worksheet_id": int(worksheet_id),
+            "class_code": class_code,
+        })
 
 
 def get_active_worksheet(class_code):
-    conn = get_conn()
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
+    engine = get_engine()
 
-    cur.execute("""
-    SELECT w.*
-    FROM classes c
-    JOIN worksheets w ON c.active_worksheet_id = w.id
-    WHERE c.class_code=?
-    """, (class_code,))
+    with engine.connect() as conn:
+        row = conn.execute(text("""
+        SELECT w.*
+        FROM classes c
+        JOIN worksheets w ON c.active_worksheet_id = w.id
+        WHERE c.class_code=:class_code
+        """), {
+            "class_code": class_code,
+        }).mappings().fetchone()
 
-    row = cur.fetchone()
-    conn.close()
-    return row
+    return row_to_dict(row) if row else None
 
 
 def start_class(class_code):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE classes SET is_started=1 WHERE class_code=?",
-        (class_code,)
-    )
-    conn.commit()
-    conn.close()
+    engine = get_engine()
+
+    with engine.begin() as conn:
+        conn.execute(text("""
+        UPDATE classes
+        SET is_started=1
+        WHERE class_code=:class_code
+        """), {
+            "class_code": class_code,
+        })
 
 
 def reset_class_start(class_code):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE classes SET is_started=0 WHERE class_code=?",
-        (class_code,)
-    )
-    conn.commit()
-    conn.close()
+    engine = get_engine()
+
+    with engine.begin() as conn:
+        conn.execute(text("""
+        UPDATE classes
+        SET is_started=0
+        WHERE class_code=:class_code
+        """), {
+            "class_code": class_code,
+        })
 
 
 def is_class_started(class_code):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT is_started FROM classes WHERE class_code=?",
-        (class_code,)
-    )
-    row = cur.fetchone()
-    conn.close()
+    engine = get_engine()
+
+    with engine.connect() as conn:
+        row = conn.execute(text("""
+        SELECT is_started
+        FROM classes
+        WHERE class_code=:class_code
+        """), {
+            "class_code": class_code,
+        }).fetchone()
+
     return bool(row and row[0] == 1)
 
 
 def open_ranking(class_code):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE classes SET is_ranking_open=1 WHERE class_code=?",
-        (class_code,)
-    )
-    conn.commit()
-    conn.close()
+    engine = get_engine()
+
+    with engine.begin() as conn:
+        conn.execute(text("""
+        UPDATE classes
+        SET is_ranking_open=1
+        WHERE class_code=:class_code
+        """), {
+            "class_code": class_code,
+        })
 
 
 def close_ranking(class_code):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE classes SET is_ranking_open=0 WHERE class_code=?",
-        (class_code,)
-    )
-    conn.commit()
-    conn.close()
+    engine = get_engine()
+
+    with engine.begin() as conn:
+        conn.execute(text("""
+        UPDATE classes
+        SET is_ranking_open=0
+        WHERE class_code=:class_code
+        """), {
+            "class_code": class_code,
+        })
 
 
 def is_ranking_open(class_code):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT is_ranking_open FROM classes WHERE class_code=?",
-        (class_code,)
-    )
-    row = cur.fetchone()
-    conn.close()
+    engine = get_engine()
+
+    with engine.connect() as conn:
+        row = conn.execute(text("""
+        SELECT is_ranking_open
+        FROM classes
+        WHERE class_code=:class_code
+        """), {
+            "class_code": class_code,
+        }).fetchone()
+
     return bool(row and row[0] == 1)
 
 
 def join_class(class_code, student_key, student_name, team_name):
-    conn = get_conn()
-    cur = conn.cursor()
+    engine = get_engine()
 
-    cur.execute("""
-    INSERT INTO participants (
-        class_code, student_key, student_name, team_name, joined_at
-    )
-    VALUES (?, ?, ?, ?, ?)
-    ON CONFLICT(class_code, student_key)
-    DO UPDATE SET
-        student_name=excluded.student_name
-    """, (
-        class_code,
-        student_key,
-        student_name,
-        team_name,
-        datetime.now().isoformat()
-    ))
-
-    conn.commit()
-    conn.close()
+    with engine.begin() as conn:
+        conn.execute(text("""
+        INSERT INTO participants (
+            class_code, student_key, student_name, team_name, joined_at
+        )
+        VALUES (
+            :class_code, :student_key, :student_name, :team_name, :joined_at
+        )
+        ON CONFLICT(class_code, student_key)
+        DO UPDATE SET
+            student_name=EXCLUDED.student_name
+        """), {
+            "class_code": class_code,
+            "student_key": student_key,
+            "student_name": student_name,
+            "team_name": team_name,
+            "joined_at": datetime.now().isoformat(),
+        })
 
 
 def get_participant(class_code, student_key):
-    conn = get_conn()
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
+    engine = get_engine()
 
-    cur.execute("""
-    SELECT *
-    FROM participants
-    WHERE class_code=? AND student_key=?
-    """, (class_code, student_key))
+    with engine.connect() as conn:
+        row = conn.execute(text("""
+        SELECT *
+        FROM participants
+        WHERE class_code=:class_code AND student_key=:student_key
+        """), {
+            "class_code": class_code,
+            "student_key": student_key,
+        }).mappings().fetchone()
 
-    row = cur.fetchone()
-    conn.close()
-    return row
+    return row_to_dict(row) if row else None
 
 
 def get_participants(class_code):
-    conn = get_conn()
-    df = pd.read_sql_query(
-        """
-        SELECT *
-        FROM participants
-        WHERE class_code=?
-        ORDER BY joined_at ASC
-        """,
-        conn,
-        params=(class_code,)
-    )
-    conn.close()
+    engine = get_engine()
+
+    with engine.connect() as conn:
+        df = pd.read_sql_query(
+            text("""
+            SELECT *
+            FROM participants
+            WHERE class_code=:class_code
+            ORDER BY joined_at ASC
+            """),
+            conn,
+            params={"class_code": class_code}
+        )
+
     return df
 
 
@@ -390,60 +402,65 @@ def save_question(
     score,
     image_data
 ):
-    conn = get_conn()
-    cur = conn.cursor()
+    engine = get_engine()
 
-    cur.execute("""
-    INSERT INTO questions (
-        class_code, worksheet_id, question_title, question_text, question_type,
-        choice_1, choice_2, choice_3, choice_4, choice_5,
-        correct_answer, score, image_data, created_at
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        class_code,
-        worksheet_id,
-        question_title,
-        question_text,
-        question_type,
-        choices.get("choice_1", ""),
-        choices.get("choice_2", ""),
-        choices.get("choice_3", ""),
-        choices.get("choice_4", ""),
-        choices.get("choice_5", ""),
-        correct_answer,
-        score,
-        image_data,
-        datetime.now().isoformat()
-    ))
-
-    conn.commit()
-    conn.close()
+    with engine.begin() as conn:
+        conn.execute(text("""
+        INSERT INTO questions (
+            class_code, worksheet_id, question_title, question_text,
+            question_type, choice_1, choice_2, choice_3, choice_4,
+            choice_5, correct_answer, score, image_data, created_at
+        )
+        VALUES (
+            :class_code, :worksheet_id, :question_title, :question_text,
+            :question_type, :choice_1, :choice_2, :choice_3, :choice_4,
+            :choice_5, :correct_answer, :score, :image_data, :created_at
+        )
+        """), {
+            "class_code": class_code,
+            "worksheet_id": int(worksheet_id),
+            "question_title": question_title,
+            "question_text": question_text,
+            "question_type": question_type,
+            "choice_1": choices.get("choice_1", ""),
+            "choice_2": choices.get("choice_2", ""),
+            "choice_3": choices.get("choice_3", ""),
+            "choice_4": choices.get("choice_4", ""),
+            "choice_5": choices.get("choice_5", ""),
+            "correct_answer": correct_answer,
+            "score": int(score),
+            "image_data": image_data,
+            "created_at": datetime.now().isoformat(),
+        })
 
 
 def get_questions(class_code, worksheet_id):
-    conn = get_conn()
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
+    engine = get_engine()
 
-    cur.execute("""
-    SELECT *
-    FROM questions
-    WHERE class_code=? AND worksheet_id=?
-    ORDER BY id ASC
-    """, (class_code, worksheet_id))
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+        SELECT *
+        FROM questions
+        WHERE class_code=:class_code AND worksheet_id=:worksheet_id
+        ORDER BY id ASC
+        """), {
+            "class_code": class_code,
+            "worksheet_id": int(worksheet_id),
+        }).mappings().all()
 
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+    return [row_to_dict(row) for row in rows]
 
 
 def delete_question(question_id):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM questions WHERE id=?", (question_id,))
-    conn.commit()
-    conn.close()
+    engine = get_engine()
+
+    with engine.begin() as conn:
+        conn.execute(text("""
+        DELETE FROM questions
+        WHERE id=:question_id
+        """), {
+            "question_id": int(question_id),
+        })
 
 
 def grade_answers(class_code, worksheet_id, student_answers):
@@ -470,17 +487,21 @@ def grade_answers(class_code, worksheet_id, student_answers):
 
 
 def already_submitted(class_code, worksheet_id, student_key):
-    conn = get_conn()
-    cur = conn.cursor()
+    engine = get_engine()
 
-    cur.execute("""
-    SELECT COUNT(*)
-    FROM submissions
-    WHERE class_code=? AND worksheet_id=? AND student_key=?
-    """, (class_code, worksheet_id, student_key))
+    with engine.connect() as conn:
+        count = conn.execute(text("""
+        SELECT COUNT(*)
+        FROM submissions
+        WHERE class_code=:class_code
+          AND worksheet_id=:worksheet_id
+          AND student_key=:student_key
+        """), {
+            "class_code": class_code,
+            "worksheet_id": int(worksheet_id),
+            "student_key": student_key,
+        }).scalar()
 
-    count = cur.fetchone()[0]
-    conn.close()
     return count > 0
 
 
@@ -494,46 +515,71 @@ def submit_answers(class_code, worksheet_id, student_key, student_name, team_nam
         return False, "이미 제출했습니다."
 
     accuracy_score, answers_text = grade_answers(class_code, worksheet_id, student_answers)
+    engine = get_engine()
 
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute("""
-    INSERT OR IGNORE INTO submissions (
-        class_code, worksheet_id, student_key, student_name, team_name,
-        answers_text, submitted_at, accuracy_score
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        class_code,
-        worksheet_id,
-        student_key,
-        student_name,
-        team_name,
-        answers_text,
-        datetime.now().isoformat(),
-        accuracy_score
-    ))
-
-    conn.commit()
-    conn.close()
+    with engine.begin() as conn:
+        conn.execute(text("""
+        INSERT INTO submissions (
+            class_code, worksheet_id, student_key, student_name, team_name,
+            answers_text, submitted_at, accuracy_score
+        )
+        VALUES (
+            :class_code, :worksheet_id, :student_key, :student_name, :team_name,
+            :answers_text, :submitted_at, :accuracy_score
+        )
+        ON CONFLICT(class_code, worksheet_id, student_key)
+        DO NOTHING
+        """), {
+            "class_code": class_code,
+            "worksheet_id": int(worksheet_id),
+            "student_key": student_key,
+            "student_name": student_name,
+            "team_name": team_name,
+            "answers_text": answers_text,
+            "submitted_at": datetime.now().isoformat(),
+            "accuracy_score": int(accuracy_score),
+        })
 
     return True, "제출 완료!"
 
 
-def get_submissions(class_code, worksheet_id):
-    conn = get_conn()
-    df = pd.read_sql_query(
-        """
+def get_submission(class_code, worksheet_id, student_key):
+    engine = get_engine()
+
+    with engine.connect() as conn:
+        row = conn.execute(text("""
         SELECT *
         FROM submissions
-        WHERE class_code=? AND worksheet_id=?
-        ORDER BY submitted_at ASC
-        """,
-        conn,
-        params=(class_code, worksheet_id)
-    )
-    conn.close()
+        WHERE class_code=:class_code
+          AND worksheet_id=:worksheet_id
+          AND student_key=:student_key
+        """), {
+            "class_code": class_code,
+            "worksheet_id": int(worksheet_id),
+            "student_key": student_key,
+        }).mappings().fetchone()
+
+    return row_to_dict(row) if row else None
+
+
+def get_submissions(class_code, worksheet_id):
+    engine = get_engine()
+
+    with engine.connect() as conn:
+        df = pd.read_sql_query(
+            text("""
+            SELECT *
+            FROM submissions
+            WHERE class_code=:class_code AND worksheet_id=:worksheet_id
+            ORDER BY submitted_at ASC
+            """),
+            conn,
+            params={
+                "class_code": class_code,
+                "worksheet_id": int(worksheet_id),
+            }
+        )
+
     return df
 
 
