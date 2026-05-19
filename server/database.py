@@ -17,9 +17,16 @@ def get_database_url():
         database_url = database_url.replace("postgres://", "postgresql://", 1)
     return database_url
 
-
+@st.cache_resource
 def get_engine():
-    return create_engine(get_database_url(), pool_pre_ping=True, pool_recycle=300)
+    return create_engine(
+        get_database_url(),
+        pool_pre_ping=True,
+        pool_recycle=300,
+        pool_size=3,
+        max_overflow=0,
+        pool_timeout=30,
+    )
 
 
 def row_to_dict(row):
