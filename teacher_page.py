@@ -1,7 +1,9 @@
+import os
 import streamlit as st
 from streamlit_js_eval import streamlit_js_eval
 
 from server.database import (
+    DB_PATH,
     create_class,
     get_classes,
     add_team,
@@ -27,6 +29,27 @@ from server.database import (
 from server.qr_utils import make_qr
 
 
+def csv_data(df):
+    return df.to_csv(index=False).encode("utf-8-sig")
+
+
+def render_db_backup_button():
+    st.sidebar.divider()
+    st.sidebar.subheader("데이터 백업")
+
+    if os.path.exists(DB_PATH):
+        with open(DB_PATH, "rb") as db_file:
+            st.sidebar.download_button(
+                "전체 DB 백업 다운로드",
+                data=db_file.read(),
+                file_name="class_quiz_backup.db",
+                mime="application/octet-stream",
+                use_container_width=True,
+            )
+    else:
+        st.sidebar.info("아직 백업할 DB 파일이 없습니다.")
+
+
 def render_teacher_page():
     st.title("👩‍🏫 교사 화면")
 
@@ -42,6 +65,8 @@ def render_teacher_page():
         ],
     )
 
+    render_db_backup_button()
+
     if menu == "클래스 생성":
         st.header("1️⃣ 클래스 생성")
 
@@ -55,7 +80,18 @@ def render_teacher_page():
                 st.success(f"클래스 생성 완료! 클래스 코드: {class_code}")
 
         st.subheader("생성된 클래스")
-        st.dataframe(get_classes(), use_container_width=True)
+        classes_df = get_classes()
+
+        if len(classes_df) == 0:
+            st.info("아직 생성된 클래스가 없습니다.")
+        else:
+            st.dataframe(classes_df, use_container_width=True)
+            st.download_button(
+                "클래스 목록 CSV 다운로드",
+                data=csv_data(classes_df),
+                file_name="classes.csv",
+                mime="text/csv",
+            )
 
     elif menu == "팀 설정":
         st.header("2️⃣ 팀 설정")
@@ -91,9 +127,13 @@ def render_teacher_page():
         if len(teams) == 0:
             st.info("아직 생성된 팀이 없습니다.")
         else:
-            st.dataframe(
-                teams[["team_name"]].rename(columns={"team_name": "팀 이름"}),
-                use_container_width=True
+            team_df = teams[["team_name"]].rename(columns={"team_name": "팀 이름"})
+            st.dataframe(team_df, use_container_width=True)
+            st.download_button(
+                "팀 목록 CSV 다운로드",
+                data=csv_data(team_df),
+                file_name=f"{selected_class}_teams.csv",
+                mime="text/csv",
             )
 
     elif menu == "활동지 만들기":
@@ -129,6 +169,13 @@ def render_teacher_page():
         if len(worksheets) == 0:
             st.info("먼저 학습지를 만들어주세요.")
             return
+
+        st.download_button(
+            "학습지 목록 CSV 다운로드",
+            data=csv_data(worksheets),
+            file_name=f"{selected_class}_worksheets.csv",
+            mime="text/csv",
+        )
 
         selected_worksheet = st.selectbox(
             "문제를 넣을 학습지 선택",
@@ -246,40 +293,43 @@ def render_teacher_page():
 
         st.divider()
 
+        deployed_url = "https://class-quiz-management-kdowbtatpzku2fbn73ypdm.streamlit.app"
+
         current_url = streamlit_js_eval(
             js_expressions="window.location.origin",
-            key="get_current_url"
+            key="get_current_url_v2"
         )
 
-        base_url = st.text_input(
-            "배포 주소 또는 현재 주소",
-            value=current_url or "",
-            placeholder="예: https://example.streamlit.app"
+        if current_url and "localhost" not in current_url and "127.0.0.1" not in current_url:
+            base_url = current_url.rstrip("/")
+        else:
+            base_url = deployed_url.rstrip("/")
+
+        student_url = f"{base_url}?class_code={selected_class}"
+
+        st.subheader("학생 입장 주소")
+        st.code(student_url)
+
+        if "localhost" in student_url or "127.0.0.1" in student_url:
+            st.error("학생 주소에 localhost가 들어가 있습니다. 배포 주소로 다시 생성해주세요.")
+            return
+
+        st.markdown(
+            f"""
+            <input type="text" value="{student_url}" id="copyTarget" style="width:100%;padding:8px;">
+            <button onclick="
+                navigator.clipboard.writeText(document.getElementById('copyTarget').value);
+                alert('주소가 복사되었습니다!');
+            ">
+            주소 복사하기
+            </button>
+            """,
+            unsafe_allow_html=True
         )
 
-        if base_url:
-            base_url = base_url.rstrip("/")
-            student_url = f"{base_url}?class_code={selected_class}"
-
-            st.subheader("학생 입장 주소")
-            st.code(student_url)
-
-            st.markdown(
-                f"""
-                <input type="text" value="{student_url}" id="copyTarget" style="width:100%;padding:8px;">
-                <button onclick="
-                    navigator.clipboard.writeText(document.getElementById('copyTarget').value);
-                    alert('주소가 복사되었습니다!');
-                ">
-                주소 복사하기
-                </button>
-                """,
-                unsafe_allow_html=True
-            )
-
-            st.subheader("학생 입장 QR 코드")
-            qr_image = make_qr(student_url)
-            st.image(qr_image, width=280)
+        st.subheader("학생 입장 QR 코드")
+        qr_image = make_qr(student_url)
+        st.image(qr_image, width=280)
 
     elif menu == "대기실 관리":
         st.header("5️⃣ 대기실 관리")
@@ -320,17 +370,23 @@ def render_teacher_page():
         st.metric("입장 학생 수", len(participants))
 
         if len(participants) > 0:
-            st.dataframe(
-                participants[[
-                    "team_name",
-                    "student_name",
-                    "joined_at"
-                ]].rename(columns={
-                    "team_name": "팀",
-                    "student_name": "학생",
-                    "joined_at": "입장 시간"
-                }),
-                use_container_width=True
+            participant_df = participants[[
+                "team_name",
+                "student_name",
+                "joined_at"
+            ]].rename(columns={
+                "team_name": "팀",
+                "student_name": "학생",
+                "joined_at": "입장 시간"
+            })
+
+            st.dataframe(participant_df, use_container_width=True)
+
+            st.download_button(
+                "입장 학생 명단 CSV 다운로드",
+                data=csv_data(participant_df),
+                file_name=f"{selected_class}_participants.csv",
+                mime="text/csv",
             )
 
         col1, col2 = st.columns(2)
@@ -402,35 +458,49 @@ def render_teacher_page():
         else:
             st.subheader("개인 제출 현황")
 
-            st.dataframe(
-                df[[
-                    "team_name",
-                    "student_name",
-                    "submitted_at",
-                    "accuracy_score"
-                ]].rename(columns={
-                    "team_name": "팀",
-                    "student_name": "학생",
-                    "submitted_at": "제출 시간",
-                    "accuracy_score": "점수"
-                }),
-                use_container_width=True
+            submission_df = df[[
+                "team_name",
+                "student_name",
+                "submitted_at",
+                "accuracy_score",
+                "answers_text"
+            ]].rename(columns={
+                "team_name": "팀",
+                "student_name": "학생",
+                "submitted_at": "제출 시간",
+                "accuracy_score": "점수",
+                "answers_text": "답안 내용"
+            })
+
+            st.dataframe(submission_df, use_container_width=True)
+
+            st.download_button(
+                "개인 제출 결과 CSV 다운로드",
+                data=csv_data(submission_df),
+                file_name=f"{selected_class}_{selected_worksheet}_submissions.csv",
+                mime="text/csv",
             )
 
             st.subheader("팀 순위")
 
             team_rank = get_team_ranking(selected_class, selected_worksheet)
 
-            st.dataframe(
-                team_rank[[
-                    "순위",
-                    "team_name",
-                    "제출인원",
-                    "정확도점수",
-                    "속도점수",
-                    "총점"
-                ]].rename(columns={
-                    "team_name": "팀"
-                }),
-                use_container_width=True
+            rank_df = team_rank[[
+                "순위",
+                "team_name",
+                "제출인원",
+                "정확도점수",
+                "속도점수",
+                "총점"
+            ]].rename(columns={
+                "team_name": "팀"
+            })
+
+            st.dataframe(rank_df, use_container_width=True)
+
+            st.download_button(
+                "팀 순위 CSV 다운로드",
+                data=csv_data(rank_df),
+                file_name=f"{selected_class}_{selected_worksheet}_team_ranking.csv",
+                mime="text/csv",
             )
