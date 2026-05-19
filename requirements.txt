@@ -3,3 +3,5 @@ pandas
 qrcode
 streamlit-autorefresh
 streamlit-js-eval
+sqlalchemy
+psycopg2-binary
